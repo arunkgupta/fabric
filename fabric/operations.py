@@ -23,13 +23,8 @@ from fabric.sftp import SFTP
 from fabric.state import env, connections, output, win32, default_channel
 from fabric.thread_handling import ThreadHandler
 from fabric.utils import (
-    abort,
-    error,
-    handle_prompt_abort,
-    indent,
-    _pty_size,
-    warn,
-    apply_lcwd
+    abort, error, handle_prompt_abort, indent, _pty_size, warn, apply_lcwd,
+    RingBuffer,
 )
 
 
@@ -256,6 +251,9 @@ def put(local_path=None, remote_path=None, use_sudo=False,
     """
     Upload one or more files to a remote host.
 
+    As with the OpenSSH ``sftp`` program, `.put` will overwrite pre-existing
+    remote files without requesting confirmation.
+
     `~fabric.operations.put` returns an iterable containing the absolute file
     paths of all remote files uploaded. This iterable also exhibits a
     ``.failed`` attribute containing any local file paths which failed to
@@ -295,7 +293,8 @@ def put(local_path=None, remote_path=None, use_sudo=False,
     scripts). To do this, specify ``mirror_local_mode=True``.
 
     Alternately, you may use the ``mode`` kwarg to specify an exact mode, in
-    the same vein as ``os.chmod`` or the Unix ``chmod`` command.
+    the same vein as ``os.chmod``, such as an exact octal number (``0755``) or
+    a string representing one (``"0755"``).
 
     `~fabric.operations.put` will honor `~fabric.context_managers.cd`, so
     relative values in ``remote_path`` will be prepended by the current remote
@@ -411,7 +410,7 @@ def put(local_path=None, remote_path=None, use_sudo=False,
 
 
 @needs_host
-def get(remote_path, local_path=None):
+def get(remote_path, local_path=None, use_sudo=False, temp_dir=""):
     """
     Download one or more files from a remote host.
 
@@ -444,6 +443,13 @@ def get(remote_path, local_path=None):
     * ``basename``: The filename part of the remote file path, e.g. the
       ``utils.py`` in ``src/projectname/utils.py``
     * ``path``: The full remote path, e.g. ``src/projectname/utils.py``.
+
+    While the SFTP protocol (which `get` uses) has no direct ability to download
+    files from locations not owned by the connecting user, you may specify
+    ``use_sudo=True`` to work around this. When set, this setting allows `get`
+    to copy (using sudo) the remote files to a temporary location on the remote end
+    (defaults to remote user's ``$HOME``; this may be overridden via ``temp_dir``),
+    and then download them to ``local_path``.
 
     .. note::
         When ``remote_path`` is an absolute directory path, only the inner
@@ -552,8 +558,14 @@ def get(remote_path, local_path=None):
         failed_remote_files = []
 
         try:
-            # Glob remote path
-            names = ftp.glob(remote_path)
+            # Glob remote path if it's a directory; otherwise use as-is
+            if (
+                ftp.isdir(remote_path)
+                or '*' in remote_path or '?' in remote_path
+            ):
+                names = ftp.glob(remote_path)
+            else:
+                names = [remote_path]
 
             # Handle invalid local-file-object situations
             if not local_is_path:
@@ -562,14 +574,13 @@ def get(remote_path, local_path=None):
 
             for remote_path in names:
                 if ftp.isdir(remote_path):
-                    result = ftp.get_dir(remote_path, local_path)
+                    result = ftp.get_dir(remote_path, local_path, use_sudo, temp_dir)
                     local_files.extend(result)
                 else:
                     # Perform actual get. If getting to real local file path,
                     # add result (will be true final path value) to
                     # local_files. File-like objects are omitted.
-                    result = ftp.get(remote_path, local_path, local_is_path,
-                        os.path.basename(remote_path))
+                    result = ftp.get(remote_path, local_path, use_sudo, local_is_path, os.path.basename(remote_path), temp_dir)
                     if local_is_path:
                         local_files.append(result)
 
@@ -651,8 +662,9 @@ def _prefix_commands(command, which):
     # Also place it at the front of the list, in case user is expecting another
     # prefixed command to be "in" the current working directory.
     cwd = env.cwd if which == 'remote' else env.lcwd
+    redirect = " >/dev/null" if not win32 else ''
     if cwd:
-        prefixes.insert(0, 'cd %s' % cwd)
+        prefixes.insert(0, 'cd %s%s' % (cwd, redirect))
     glue = " && "
     prefix = (glue.join(prefixes) + glue) if prefixes else ""
     return prefix + command
@@ -705,7 +717,8 @@ def _prefix_env_vars(command, local=False):
 
 
 def _execute(channel, command, pty=True, combine_stderr=None,
-    invoke_shell=False, stdout=None, stderr=None, timeout=None):
+    invoke_shell=False, stdout=None, stderr=None, timeout=None,
+    capture_buffer_size=None):
     """
     Execute ``command`` over ``channel``.
 
@@ -719,6 +732,10 @@ def _execute(channel, command, pty=True, combine_stderr=None,
     ``invoke_shell`` controls whether we use ``exec_command`` or
     ``invoke_shell`` (plus a handful of other things, such as always forcing a
     pty.)
+
+    ``capture_buffer_size`` controls the length of the ring-buffers used to
+    capture stdout/stderr. (This is ignored if ``invoke_shell=True``, since
+    that completely disables capturing overall.)
 
     Returns a three-tuple of (``stdout``, ``stderr``, ``status``), where
     ``stdout``/``stderr`` are captured output strings and ``status`` is the
@@ -767,7 +784,8 @@ def _execute(channel, command, pty=True, combine_stderr=None,
 
         # Init stdout, stderr capturing. Must use lists instead of strings as
         # strings are immutable and we're using these as pass-by-reference
-        stdout_buf, stderr_buf = [], []
+        stdout_buf = RingBuffer(value=[], maxlen=capture_buffer_size)
+        stderr_buf = RingBuffer(value=[], maxlen=capture_buffer_size)
         if invoke_shell:
             stdout_buf = stderr_buf = None
 
@@ -872,7 +890,8 @@ def _noop():
 
 def _run_command(command, shell=True, pty=True, combine_stderr=True,
     sudo=False, user=None, quiet=False, warn_only=False, stdout=None,
-    stderr=None, group=None, timeout=None, shell_escape=None):
+    stderr=None, group=None, timeout=None, shell_escape=None,
+    capture_buffer_size=None):
     """
     Underpinnings of `run` and `sudo`. See their docstrings for more info.
     """
@@ -892,7 +911,7 @@ def _run_command(command, shell=True, pty=True, combine_stderr=True,
 
         # Handle context manager modifications, and shell wrapping
         wrapped_command = _shell_wrap(
-            _prefix_commands(_prefix_env_vars(command), 'remote'),
+            _prefix_env_vars(_prefix_commands(command, 'remote')),
             shell_escape,
             shell,
             _sudo_prefix(user, group) if sudo else None
@@ -908,7 +927,8 @@ def _run_command(command, shell=True, pty=True, combine_stderr=True,
         result_stdout, result_stderr, status = _execute(
             channel=default_channel(), command=wrapped_command, pty=pty,
             combine_stderr=combine_stderr, invoke_shell=False, stdout=stdout,
-            stderr=stderr, timeout=timeout)
+            stderr=stderr, timeout=timeout,
+            capture_buffer_size=capture_buffer_size)
 
         # Assemble output string
         out = _AttributeString(result_stdout)
@@ -946,7 +966,8 @@ def _run_command(command, shell=True, pty=True, combine_stderr=True,
 
 @needs_host
 def run(command, shell=True, pty=True, combine_stderr=None, quiet=False,
-    warn_only=False, stdout=None, stderr=None, timeout=None, shell_escape=None):
+    warn_only=False, stdout=None, stderr=None, timeout=None, shell_escape=None,
+    capture_buffer_size=None):
     """
     Run a shell command on a remote host.
 
@@ -954,7 +975,13 @@ def run(command, shell=True, pty=True, combine_stderr=None, quiet=False,
     string via a shell interpreter, the value of which may be controlled by
     setting ``env.shell`` (defaulting to something similar to ``/bin/bash -l -c
     "<command>"``.) Any double-quote (``"``) or dollar-sign (``$``) characters
-    in ``command`` will be automatically escaped when ``shell`` is True.
+    in ``command`` will be automatically escaped when ``shell`` is True (unless
+    disabled by setting ``shell_escape=False``).
+
+    When ``shell=False``, no shell wrapping or escaping will occur. (It's
+    possible to specify ``shell=False, shell_escape=True`` if desired, which
+    will still trigger escaping of dollar signs, etc but will not wrap with a
+    shell program invocation).
 
     `run` will return the result of the remote program's stdout as a single
     (likely multiline) string. This string will exhibit ``failed`` and
@@ -963,6 +990,21 @@ def run(command, shell=True, pty=True, combine_stderr=None, quiet=False,
     attribute. Furthermore, it includes a copy of the requested & actual
     command strings executed, as ``.command`` and ``.real_command``,
     respectively.
+
+    To lessen memory use when running extremely verbose programs (and,
+    naturally, when having access to their full output afterwards is not
+    necessary!) you may limit how much of the program's stdout/err is stored by
+    setting ``capture_buffer_size`` to an integer value.
+
+    .. warning::
+        Do not set ``capture_buffer_size`` to any value smaller than the length
+        of ``env.sudo_prompt`` or you will likely break the functionality of
+        `sudo`! Ditto any user prompts stored in ``env.prompts``.
+
+    .. note::
+        This value is used for each buffer independently, so e.g. ``1024`` may
+        result in storing a total of ``2048`` bytes if there's data in both
+        streams.)
 
     Any text entered in your local terminal will be forwarded to the remote
     program as it runs, thus allowing you to interact with password or other
@@ -1036,16 +1078,21 @@ def run(command, shell=True, pty=True, combine_stderr=None, quiet=False,
 
     .. versionadded:: 1.7
         The ``shell_escape`` argument.
+
+    .. versionadded:: 1.11
+        The ``capture_buffer_size`` argument.
     """
-    return _run_command(command, shell, pty, combine_stderr, quiet=quiet,
+    return _run_command(
+        command, shell, pty, combine_stderr, quiet=quiet,
         warn_only=warn_only, stdout=stdout, stderr=stderr, timeout=timeout,
-        shell_escape=shell_escape)
+        shell_escape=shell_escape, capture_buffer_size=capture_buffer_size,
+    )
 
 
 @needs_host
 def sudo(command, shell=True, pty=True, combine_stderr=None, user=None,
     quiet=False, warn_only=False, stdout=None, stderr=None, group=None,
-    timeout=None, shell_escape=None):
+    timeout=None, shell_escape=None, capture_buffer_size=None):
     """
     Run a shell command on a remote host, with superuser privileges.
 
@@ -1087,12 +1134,16 @@ def sudo(command, shell=True, pty=True, combine_stderr=None, user=None,
 
     .. versionadded:: 1.7
         The ``shell_escape`` argument.
+
+    .. versionadded:: 1.11
+        The ``capture_buffer_size`` argument.
     """
     return _run_command(
         command, shell, pty, combine_stderr, sudo=True,
         user=user if user else env.sudo_user,
         group=group, quiet=quiet, warn_only=warn_only, stdout=stdout,
         stderr=stderr, timeout=timeout, shell_escape=shell_escape,
+        capture_buffer_size=capture_buffer_size,
     )
 
 
@@ -1165,12 +1216,9 @@ def local(command, capture=False, shell=None):
         err_stream = None if output.stderr else dev_null
     try:
         cmd_arg = wrapped_command if win32 else [wrapped_command]
-        if shell is not None:
-            p = subprocess.Popen(cmd_arg, shell=True, stdout=out_stream,
-                                 stderr=err_stream, executable=shell)
-        else:
-            p = subprocess.Popen(cmd_arg, shell=True, stdout=out_stream,
-                                 stderr=err_stream)
+        p = subprocess.Popen(cmd_arg, shell=True, stdout=out_stream,
+                             stderr=err_stream, executable=shell,
+                             close_fds=(not win32))
         (stdout, stderr) = p.communicate()
     finally:
         if dev_null is not None:
@@ -1193,7 +1241,7 @@ def local(command, capture=False, shell=None):
 
 
 @needs_host
-def reboot(wait=120, command='reboot'):
+def reboot(wait=120, command='reboot', use_sudo=True):
     """
     Reboot the remote system.
 
@@ -1217,6 +1265,9 @@ def reboot(wait=120, command='reboot'):
         Changed the ``wait`` kwarg to be optional, and refactored to leverage
         the new reconnection functionality; it may not actually have to wait
         for ``wait`` seconds before reconnecting.
+    .. versionchanged:: 1.11
+        Added ``use_sudo`` as a kwarg. Maintained old functionality by setting
+        the default value to True.
     """
     # Shorter timeout for a more granular cycle than the default.
     timeout = 5
@@ -1230,7 +1281,7 @@ def reboot(wait=120, command='reboot'):
         timeout=timeout,
         connection_attempts=attempts
     ):
-        sudo(command)
+        (sudo if use_sudo else run)(command)
         # Try to make sure we don't slip in before pre-reboot lockdown
         time.sleep(5)
         # This is actually an internal-ish API call, but users can simply drop
